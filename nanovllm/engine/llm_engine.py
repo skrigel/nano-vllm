@@ -65,22 +65,39 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
         return_metrics: bool = False,
+        max_concurrency: int | None = None,
     ) -> tuple[list[dict], dict] | list[dict]:
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         sequences = {}
-        for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp)
-        # Track sequences by ID for metrics
-        for seq in self.scheduler.waiting:
-            sequences[seq.seq_id] = seq
+
+        # Closed-loop workload: maintain fixed concurrency
+        if max_concurrency is not None:
+            pending_requests = list(zip(prompts, sampling_params))
+            # Submit first N requests
+            for prompt, sp in pending_requests[:max_concurrency]:
+                self.add_request(prompt, sp)
+            pending_requests = pending_requests[max_concurrency:]
+            # Track sequences by ID for metrics
+            for seq in self.scheduler.waiting:
+                sequences[seq.seq_id] = seq
+        else:
+            # Burst mode: submit all requests at once
+            for prompt, sp in zip(prompts, sampling_params):
+                self.add_request(prompt, sp)
+            # Track sequences by ID for metrics
+            for seq in self.scheduler.waiting:
+                sequences[seq.seq_id] = seq
+            pending_requests = []
+
         outputs = {}
         prefill_throughput = decode_throughput = 0.
         total_prefill_tokens = total_prefill_time = 0.
         total_decode_tokens = total_decode_time = 0.
         ttfts = []
         latencies = []
+        tpots = []
         overall_start = perf_counter()
         while not self.is_finished():
             t = perf_counter()
@@ -106,6 +123,21 @@ class LLMEngine:
                         ttfts.append(seq.t_first_token - seq.t_submitted)
                     if seq.t_completed is not None:
                         latencies.append(seq.t_completed - seq.t_submitted)
+                    # Calculate per-request TPOT
+                    if seq.t_first_token is not None and seq.t_completed is not None and seq.num_completion_tokens > 1:
+                        tpot = (seq.t_completed - seq.t_first_token) / (seq.num_completion_tokens - 1)
+                        tpots.append(tpot)
+
+                # Closed-loop: submit next request when one finishes
+                if max_concurrency is not None and pending_requests:
+                    prompt, sp = pending_requests.pop(0)
+                    self.add_request(prompt, sp)
+                    # Track new sequence
+                    for new_seq in self.scheduler.waiting:
+                        if new_seq.seq_id not in sequences:
+                            sequences[new_seq.seq_id] = new_seq
+                            break
+
                 pbar.update(1)
 
         overall_end = perf_counter()
@@ -153,6 +185,15 @@ class LLMEngine:
                 "latency_values_s": latencies,
             })
 
+        # Add per-request TPOT statistics
+        if tpots:
+            tpots_ms = [t * 1000 for t in tpots]
+            metrics.update({
+                "tpot_per_request_avg_ms": np.mean(tpots_ms),
+                "tpot_per_request_min_ms": np.min(tpots_ms),
+                "tpot_per_request_max_ms": np.max(tpots_ms),
+            })
+
         # Print metrics summary
         if use_tqdm:
             print("\n=== Generation Metrics ===")
@@ -162,7 +203,9 @@ class LLMEngine:
                 print(f"Prefill Throughput: {metrics['prefill_throughput_tok_per_s']:.2f} tok/s")
             if total_decode_time > 0:
                 print(f"Decode Throughput: {metrics['decode_throughput_tok_per_s']:.2f} tok/s")
-                print(f"TPOT (Time Per Output Token): {metrics['tpot_ms']:.2f} ms")
+                print(f"TPOT (aggregate): {metrics['tpot_ms']:.2f} ms")
+            if tpots:
+                print(f"TPOT (per-request): {metrics['tpot_per_request_avg_ms']:.2f} ms (avg), {metrics['tpot_per_request_min_ms']:.2f} ms (min), {metrics['tpot_per_request_max_ms']:.2f} ms (max)")
             if ttfts:
                 print(f"TTFT (Time To First Token): {metrics['ttft_avg_ms']:.2f} ms (avg), {metrics['ttft_min_ms']:.2f} ms (min), {metrics['ttft_max_ms']:.2f} ms (max)")
             if latencies:
