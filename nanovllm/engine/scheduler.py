@@ -70,8 +70,11 @@ class Scheduler:
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
+
+        # FIFO
+        self.running.extendleft(reversed(scheduled_seqs))
         # Round-robin: put scheduled sequences at the back of the queue
-        self.running.extend(scheduled_seqs)
+        # self.running.extend(scheduled_seqs)
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
